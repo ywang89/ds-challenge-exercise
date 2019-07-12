@@ -1,0 +1,262 @@
+---
+title: "Conversion Rate"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      smooth_scroll: false
+---
+
+```{r c1-config, results='hide'}
+library(plyr)
+library(dplyr)
+library(ggplot2)
+library(stringr)
+library(randomForest)
+library(gridExtra)
+library(rpart)
+library(rpart.plot)
+
+knitr::opts_knit$set(root.dir = "~/Projects/a-collection-of-ds-challenges/q1-conversion-rate/")
+```
+
+## Understanding Data
+
+Read data.
+
+```{r c2-read-data}
+df.0 = read.table("../data/conversion_rate/conversion_data.csv", header = TRUE, sep = ",",
+                  quote = "\"", na.strings = c(""), stringsAsFactors = FALSE)
+```
+
+Before analyzing, let's check the quality of data.
+
+```{r c3-data-quality}
+missing.values = sapply(df.0, function(x) sum(is.na(x)))
+missing.values[missing.values > as.integer(0)]
+
+typeof(df.0$country)
+table(df.0$country, useNA = "i")
+
+typeof(df.0$age)
+ggplot(df.0) + geom_histogram(aes(age), binwidth = 5)
+summary(df.0$age)
+nrow(df.0 %>% filter(age > 100))
+summary(df.0 %>% filter(age <= 100) %>% pull(age)) # !! age > 100 are anomalies, delete since there're only 2 records
+
+typeof(df.0$new_user)
+table(df.0$new_user, useNA = "i")
+
+typeof(df.0$source)
+table(df.0$source, useNA = "i")
+
+typeof(df.0$total_pages_visited)
+ggplot(df.0) + geom_histogram(aes(total_pages_visited), binwidth = 1)
+
+typeof(df.0$converted)
+table(df.0$converted, useNA = "i")
+
+```
+
+There are 2 users with age > 100. Since there are only 2 rows, here we'll treat it as simply data entry error, and remove the 2 rows from dataset.
+
+```{r c4-data-clean}
+df.1 =
+  df.0 %>%
+  filter(age <= 100) %>%
+  mutate(
+    country = as.factor(country),
+    new_user = as.factor(new_user),
+    source = as.factor(source),
+    converted = as.factor(converted))
+```
+
+Now let's perform some exploratory analysis.
+
+```{r c5-exploratory}
+# 3% conversion rate, is about industry standard
+sum(as.numeric(as.character(df.1$converted))) / nrow(df.1)
+
+# write a function that does the analysis
+CalcConversionRate = function(df, group_var){
+  sym_group_var = sym(group_var)
+  
+  df.group =
+    df %>%
+    group_by(!!sym_group_var) %>%
+    summarise(cnt_converted = sum(converted == "1"),
+              cnt_total = n()) %>%
+    mutate(conversion_rate = cnt_converted / cnt_total)
+  
+  p1 = ggplot(df.group) +
+    geom_bar(aes_string(x=group_var, y="conversion_rate"), stat = "identity") +
+    geom_hline(yintercept = sum(df$converted == "1") / nrow(df), color = "orange") +
+    labs(title = paste("Conversion Rate by ", group_var, sep = ""),
+         y = "Conversion Rate")
+  
+  p2 = ggplot(df, aes(fill = converted)) +
+    geom_bar(aes_string(x=group_var)) +
+    labs(title = paste("Count by ", group_var, sep = ""),
+         y = "Count")
+  
+  return(list(df.group, p1, p2))
+}
+```
+
+
+```{r c6-country}
+result.country = CalcConversionRate(df.1, "country")
+result.country[[1]]
+grid.arrange(result.country[[2]], result.country[[3]], ncol = 2)
+```
+
+China's conversion rate is significantly lower, while having the second largest traffic.
+
+```{r c7-age}
+result.age = CalcConversionRate(df.1 %>%
+                                  mutate(age_bkt = age %/% 5,
+                                         age_bkt = as.factor(age_bkt)), 
+                                "age_bkt")
+result.age[[1]]
+grid.arrange(result.age[[2]], result.age[[3]], ncol = 2)
+```
+
+When age <= 24, conversion rate is significantly higher than average. Especially so for when age is < 20.
+
+```{r c8-new-user}
+result.new.user = CalcConversionRate(df.1, "new_user")
+
+result.new.user[[1]]
+grid.arrange(result.new.user[[2]], result.new.user[[3]], ncol = 2)
+```
+
+Old users have significantly higher than average conversion rate.
+
+```{r c9-source}
+result.source = CalcConversionRate(df.1, "source")
+
+result.source[[1]]
+grid.arrange(result.source[[2]], result.source[[3]], ncol = 2)
+```
+
+There are no significant difference in conversion rates among different sources.
+
+```{r c10-total-pages-visited}
+result.pages = CalcConversionRate(df.1, 
+                                   "total_pages_visited")
+result.pages[[1]]
+grid.arrange(result.pages[[2]], result.pages[[3]], ncol = 2)
+```
+
+## Modeling
+
+I chose to use Random Forests to model the conversion rate because:
+
+  * Higher accuracy
+  * Good when there're categorical variables
+  * works well in high dimension
+  * works will with outliers
+  * works well with irrelevant variables
+  * works well with both continuous and discrete variables
+
+Now I split data into training/test, and build a random forests.
+
+```{r c11-modeling}
+train.records = sample(nrow(df.1), nrow(df.1) * 0.66)
+train = df.1[train.records, ]
+test = df.1[-train.records, ]
+
+set.seed(1)
+rf.model.1 = randomForest(x = train %>% select(-converted), 
+                        y = train$converted,
+                        xtest = test %>% select(-converted), 
+                        ytest = test$converted,
+                        importance = TRUE, ntree = 100)
+
+rf.model.1
+```
+
+```{r c12-var-imp}
+varImpPlot(rf.model.1, type = 2)
+```
+
+Finding:
+
+  * total_pages_visited is the most important variable; however, this variable is not "actionale" because users with intent to buy will of course need to click on more pages to complete the conversion.
+  
+As a result, we build another random forest without this feature. Since data are highly imbalanced, and we don't have the powerful variable, we adjust the weights of classes.
+
+```{r c13-modeling}
+rf.model.2 = 
+  randomForest(
+    x = train %>% select(-converted, -total_pages_visited), 
+    y = train$converted,
+    xtest = test %>% select(-converted, -total_pages_visited), 
+    ytest = test$converted,
+    classwt = c(0.7, 0.3), keep.forest = TRUE,
+    importance = TRUE, ntree = 100)
+
+rf.model.2
+```
+
+Model accuracy decreased, but good enough for the purpose of providing insights.
+
+```{r c14-var-imp}
+varImpPlot(rf.model.2, type = 2)
+```
+
+```{r c15-pdp}
+par(mfrow = c(2, 2))
+par(mar = c(2, 2, 2, 2))
+partialPlot(rf.model.2, train, country, 1)
+partialPlot(rf.model.2, train, age, 1)
+partialPlot(rf.model.2, train, new_user, 1)
+partialPlot(rf.model.2, train, source, 1)
+par(mfrow = c(1, 1))
+```
+
+Findings are:
+
+  * new_user is the most important
+  * country is the second important
+  * age is the third important
+  * source is not important
+
+Build a simple decision tree to verify that our thoughts are right.
+
+```{r c16-decision-tree}
+t.1 =
+  rpart(converted ~ .,
+        data = df.1 %>% select(-total_pages_visited),
+        method = "class",
+        parms = list(prior = c(0.7, 0.3)),
+        control = rpart.control(maxdepth = 3),
+        model = TRUE)
+
+t.1
+
+rpart.plot(t.1, type = 3)
+```
+
+This tree is in line with our findings.
+
+## Conclusion
+
+1. On new_user:
+
+  * For existing users: Ask marketing team to reach out to existing users to gain retention; e.g., targeted email.
+  * For new users: discuss with Product teams to see what can be done to convert new users. could it be that pages are too complex for new users to get used to?
+
+2. On country:
+
+  * China has large amount of users, but has very low conversion rate. Disscuss with product teams to figure out potential reasons. Could it be translation, or that Chinese consumers are not used to the product's check out pages, etc.
+  * Germany and UK has very high conversiion rate, but much fewer traffic; a good idea to ask marketing teams to attract more users from these 2 locations.
+
+3. On age:
+
+  * Young people has significantly higher conversion rate (age < 25), especially so for age < 20. It's a good idea to speak with marketing teams and try expanding this population.
+  * Older people have lower conversion rates; speaking with product teams and figure out what could be the causes; e.g., could it be UI is too complex?
+
+4. On total_pages_visited:
+
+  * For users who visited manay pages but didn't convert, we could try sending reminder emails or targeted offers.
